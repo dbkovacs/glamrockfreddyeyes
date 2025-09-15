@@ -1,0 +1,12 @@
+# Ignore the Arduino build directory and files
+/build/
+*.o
+*.a
+*.so
+*.elf
+*.hex
+*.bin
+*.eep
+
+# Ignore local editor configuration
+.vscode/
