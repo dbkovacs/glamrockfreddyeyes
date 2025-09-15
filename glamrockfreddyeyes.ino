@@ -1,12 +1,12 @@
 /*
-  Glamrock Freddy Eyes Controller (Arduino Uno/Nano Version - Fully Non-Blocking)
-  For Arduino Uno/Nano and two 16-LED WS2212B rings.
+  Glamrock Freddy Eyes Controller (Arduino Nano Version - Fully Non-Blocking)
+  For Arduino Nano and two 16-LED WS2212B rings.
   Control 20 preset light shows via a physical pushbutton and rotary encoder.
   All animations are non-blocking to ensure the controls are always responsive.
-  Uses a robust state-machine with optimized ISRs for reading the rotary encoder.
+  Uses a robust state-machine for reading the rotary encoder.
 
   --- BILL OF MATERIALS ---
-  - 1x Arduino Uno or Nano (or compatible board)
+  - 1x Arduino Nano (or compatible board)
   - 2x 16-LED WS2812B NeoPixel Rings
   - 1x 5-pin Rotary Encoder Module (KY-040 or similar)
   - 1x Momentary Pushbutton
@@ -86,8 +86,8 @@
 Adafruit_NeoPixel leftEye(NUM_LEDS, LEFT_EYE_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel rightEye(NUM_LEDS, RIGHT_EYE_PIN, NEO_GRB + NEO_KHZ800);
 
-// Current light show preset
-uint8_t currentPreset = 0;
+// Current light show preset - volatile because it's changed in an ISR
+volatile uint8_t currentPreset = 0;
 uint8_t lastPreset = 255; // Used to detect when a preset changes
 
 // --- Variables for Button Debouncing ---
@@ -101,14 +101,14 @@ int lastEncoderButtonState = HIGH;
 unsigned long encoderButtonDownTime = 0;
 bool longPressActionDone = false;
 
+
 // --- Variables for Rotary Encoder State Machine ---
 volatile byte aFlag = 0;
 volatile byte bFlag = 0;
-volatile int encoderDirection = 0; // 0 = No Turn, 1 = Clockwise, -1 = Counter-Clockwise
 
 // --- State Variables for Non-Blocking Animations ---
 unsigned long lastUpdateTime = 0; // Generic timer for animations
-uint16_t animationCounter = 0;    // Generic counter for animation steps
+uint16_t animationCounter = 0;      // Generic counter for animation steps
 uint16_t animationSubCounter = 0; // Generic sub-counter
 
 void setup() {
@@ -122,9 +122,9 @@ void setup() {
   pinMode(ENCODER_CLK_PIN, INPUT_PULLUP);
   pinMode(ENCODER_DT_PIN, INPUT_PULLUP);
 
-  // Attach two interrupts for the encoder dial, one for each pin, looking for a RISING edge
-  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK_PIN), PinA, RISING);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_DT_PIN), PinB, RISING);
+  // Attach a single interrupt for one encoder pin
+  // The logic inside the ISR will determine the direction from the second pin's state.
+  attachInterrupt(digitalPinToInterrupt(ENCODER_DT_PIN), encoderIsr, CHANGE);
 
   leftEye.begin();
   rightEye.begin();
@@ -133,7 +133,6 @@ void setup() {
 }
 
 void loop() {
-  checkEncoderTurn(); // Check if the dial has been turned
   checkButton();
   checkEncoderButton();
 
@@ -141,8 +140,8 @@ void loop() {
   if (currentPreset != lastPreset) {
     animationCounter = 0; // Reset counters
     animationSubCounter = 0;
-    lastUpdateTime = 0;     // Reset timer
-    allOff();               // Clear the eyes
+    lastUpdateTime = 0;      // Reset timer
+    allOff();              // Clear the eyes
     leftEye.setBrightness(255); // Reset brightness
     rightEye.setBrightness(255);
     lastPreset = currentPreset;
@@ -176,55 +175,6 @@ void loop() {
   }
 }
 
-// --- Interrupt Service Routines for Rotary Encoder Dial ---
-
-void PinA() {
-  cli(); // Stop interrupts
-  if (digitalRead(ENCODER_DT_PIN) && aFlag) {
-    encoderDirection = -1; // Set flag for Counter-Clockwise turn
-    aFlag = 0;
-    bFlag = 0;
-  }
-  else if (!digitalRead(ENCODER_DT_PIN)) {
-    bFlag = 1;
-  }
-  sei(); // Restart interrupts
-}
-
-void PinB() {
-  cli(); // Stop interrupts
-  if (digitalRead(ENCODER_CLK_PIN) && bFlag) {
-    encoderDirection = 1; // Set flag for Clockwise turn
-    aFlag = 0;
-    bFlag = 0;
-  }
-  else if (!digitalRead(ENCODER_CLK_PIN)) {
-    aFlag = 1;
-  }
-  sei(); // Restart interrupts
-}
-
-// --- Input Reading Functions ---
-
-// Checks if the encoder dial flag has been set by an ISR
-void checkEncoderTurn() {
-  if (encoderDirection != 0) { // If a turn has been detected
-    if (encoderDirection == 1) { // Clockwise
-      currentPreset++;
-      if (currentPreset >= TOTAL_PRESETS) {
-        currentPreset = 0;
-      }
-    } else { // Counter-Clockwise
-      if (currentPreset == 0) { // Wrap around
-        currentPreset = TOTAL_PRESETS - 1;
-      } else {
-        currentPreset--;
-      }
-    }
-    encoderDirection = 0; // Reset the flag
-  }
-}
-
 // Checks the external pushbutton (jumps 1)
 void checkButton() {
   int reading = digitalRead(BUTTON_PIN);
@@ -235,6 +185,7 @@ void checkButton() {
     if (reading != buttonState) {
       buttonState = reading;
       if (buttonState == LOW) {
+        // Jump 1 preset forward
         currentPreset = (currentPreset + 1) % TOTAL_PRESETS;
       }
     }
@@ -245,26 +196,45 @@ void checkButton() {
 // Checks the encoder's pushbutton (short press jumps 5, long press resets to 0)
 void checkEncoderButton() {
   int reading = digitalRead(ENCODER_SW_PIN);
+
+  // If the button is pressed
   if (reading == LOW) {
+    // If it was just pressed (state changing from HIGH to LOW)
     if (lastEncoderButtonState == HIGH) {
-      encoderButtonDownTime = millis();
-      longPressActionDone = false;
+      encoderButtonDownTime = millis(); // Record the time it was pressed
+      longPressActionDone = false;      // Reset the long press flag
     }
+    // Check if the button has been held for 1 second AND the long press action hasn't been done yet
     if ((millis() - encoderButtonDownTime > 1000) && !longPressActionDone) {
-      currentPreset = 0;
-      longPressActionDone = true;
+      currentPreset = 0;         // Reset to case 0
+      longPressActionDone = true; // Mark the long press action as complete
     }
   } 
+  // If the button is released
   else {
+    // If it was just released (state changing from LOW to HIGH)
     if (lastEncoderButtonState == LOW) {
+      // And if a long press action was NOT completed, it's a short press
       if (!longPressActionDone) {
-        currentPreset = (currentPreset + 5) % TOTAL_PRESETS;
+        currentPreset = (currentPreset + 5) % TOTAL_PRESETS; // Jump 5 presets forward
       }
     }
   }
-  lastEncoderButtonState = reading;
+  lastEncoderButtonState = reading; // Save the current state for the next loop
 }
 
+
+// --- Interrupt Service Routine for Rotary Encoder ---
+void encoderIsr() {
+  // Read the state of both pins to determine the direction
+  if (digitalRead(ENCODER_CLK_PIN) != digitalRead(ENCODER_DT_PIN)) {
+    // Turned Clockwise
+    currentPreset = (currentPreset + 1) % TOTAL_PRESETS;
+  } else {
+    // Turned Counter-Clockwise
+    currentPreset = (currentPreset - 1 + TOTAL_PRESETS) % TOTAL_PRESETS;
+  }
+}
 
 // --- Light Show Functions (Fully Non-Blocking) ---
 
@@ -597,7 +567,7 @@ void colorTwinkle(int wait) {
 // 19: Green Matrix
 void greenMatrix(int wait) {
     // Fade all pixels
-    for(int i=0;nn i<NUM_LEDS; i+  + ) {
+    for(int i=0; i<NUM_LEDS; i++) {
         uint32_t color = leftEye.getPixelColor(i);
         uint8_t green = (color >> 8) & 0xFF;
         green = (green <= 20) ? 0 : green - 20;
@@ -607,8 +577,8 @@ void greenMatrix(int wait) {
 
     if (millis() - lastUpdateTime > wait) {
         lastUpdateTime = millis();
-        if (random(10 ) > 6) {
-            int pixel = random(NUM _ LEDS);
+        if (random(10) > 6) {
+            int pixel = random(NUM_LEDS);
             leftEye.setPixelColor(pixel, 0, 255, 0);
             rightEye.setPixelColor(pixel, 0, 255, 0);
         }
